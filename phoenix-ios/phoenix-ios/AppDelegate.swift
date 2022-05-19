@@ -5,7 +5,7 @@ import Firebase
 import Combine
 import BackgroundTasks
 
-#if DEBUG && false
+#if DEBUG && true
 fileprivate var log = Logger(
 	subsystem: Bundle.main.bundleIdentifier!,
 	category: "AppDelegate"
@@ -58,7 +58,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 		return _encryptedNodeId
 	}
 	
-	private var walletLoaded = false
+	private var walletInfo: WalletManager.WalletInfo? = nil
+	private var pushToken: String? = nil
 	private var fcmToken: String? = nil
 	private var peerConnectionState: Lightning_kmpConnection? = nil
 	
@@ -81,14 +82,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 		business = PhoenixBusiness(ctx: PlatformContext())
 		AppDelegate._isTestnet = business.chain.isTestnet()
 		super.init()
-		performVersionUpgradeChecks()
+		AppMigration.performMigrationChecks()
 		
-		let electrumConfig = Prefs.shared.electrumConfig
+		let electrumConfig = GroupPrefs.shared.electrumConfig
 		business.appConfigurationManager.updateElectrumConfig(server: electrumConfig?.serverAddress)
 		
 		let preferredFiatCurrencies = AppConfigurationManager.PreferredFiatCurrencies(
-			primary: Prefs.shared.fiatCurrency,
-			others: Prefs.shared.preferredFiatCurrencies
+			primary: GroupPrefs.shared.fiatCurrency,
+			others: GroupPrefs.shared.preferredFiatCurrencies
 		)
 		business.appConfigurationManager.updatePreferredFiatCurrencies(current: preferredFiatCurrencies)
 		
@@ -154,15 +155,20 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 		
 		// PreferredFiatCurrenies observers
 		Publishers.CombineLatest(
-			Prefs.shared.fiatCurrencyPublisher,
-			Prefs.shared.currencyConverterListPublisher
+			GroupPrefs.shared.fiatCurrencyPublisher,
+			GroupPrefs.shared.currencyConverterListPublisher
 		).sink { _ in
 			let current = AppConfigurationManager.PreferredFiatCurrencies(
-				primary: Prefs.shared.fiatCurrency,
-				others: Prefs.shared.preferredFiatCurrencies
+				primary: GroupPrefs.shared.fiatCurrency,
+				others: GroupPrefs.shared.preferredFiatCurrencies
 			)
 			self.business.appConfigurationManager.updatePreferredFiatCurrencies(current: current)
 		}.store(in: &cancellables)
+		
+		
+		CrossProcessCommunication.shared.start(receivedMessage: {
+			self.didReceiveMessageFromAppExtension()
+		})
 		
 		return true
 	}
@@ -250,6 +256,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 		let pushToken = deviceToken.map { String(format: "%02.2hhx", $0) }.joined()
 		log.debug("pushToken: \(pushToken)")
 		
+		self.pushToken = pushToken
+		maybeRegisterPushToken()
 		Messaging.messaging().apnsToken = deviceToken
 	}
 
@@ -708,21 +716,21 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 		log.trace("loadWallet()")
 		assertMainThread()
 		
-		guard walletLoaded == false else {
+		guard walletInfo == nil else {
 			return false
 		}
 		
-		let seed = knownSeed ?? business.prepWallet(mnemonics: mnemonics, passphrase: "")
-		let cloudInfo = business.loadWallet(seed: seed)
-		walletLoaded = true
+		let seed = knownSeed ?? business.walletManager.mnemonicsToSeed(mnemonics: mnemonics, passphrase: "")
+		walletInfo = business.walletManager.loadWallet(seed: seed)
 		
+		maybeRegisterPushToken()
 		maybeRegisterFcmToken()
 		setupActivePaymentsListener()
 		
-		if let cloudInfo = cloudInfo {
+		if let walletInfo = walletInfo {
 			
-			let cloudKey = cloudInfo.first!
-			let encryptedNodeId = cloudInfo.second! as String
+			let cloudKey = walletInfo.cloudKey
+			let encryptedNodeId = walletInfo.encryptedNodeId as String
 			
 			if let walletRestoreType = walletRestoreType {
 				switch walletRestoreType {
@@ -731,26 +739,26 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 					// User is restoring wallet after manually typing in the recovery phrase.
 					// So we can mark the manual_backup task as completed.
 					//
-					Prefs.shared.manualBackup_setTaskDone(true, encryptedNodeId: encryptedNodeId)
+					Prefs.shared.backupSeed.manualBackup_setTaskDone(true, encryptedNodeId: encryptedNodeId)
 					//
 					// And ensure cloud backup is disabled for the wallet.
 					//
-					Prefs.shared.backupSeed_isEnabled = false
-					Prefs.shared.backupSeed_setName(nil, encryptedNodeId: encryptedNodeId)
-					Prefs.shared.backupSeed_setHasUploadedSeed(false, encryptedNodeId: encryptedNodeId)
+					Prefs.shared.backupSeed.isEnabled = false
+					Prefs.shared.backupSeed.setName(nil, encryptedNodeId: encryptedNodeId)
+					Prefs.shared.backupSeed.setHasUploadedSeed(false, encryptedNodeId: encryptedNodeId)
 					
 				case .fromCloudBackup(let name):
 					//
 					// User is restoring wallet from an existing iCloud backup.
 					// So we can mark the iCloud backpu as completed.
 					//
-					Prefs.shared.backupSeed_isEnabled = true
-					Prefs.shared.backupSeed_setName(name, encryptedNodeId: encryptedNodeId)
-					Prefs.shared.backupSeed_setHasUploadedSeed(true, encryptedNodeId: encryptedNodeId)
+					Prefs.shared.backupSeed.isEnabled = true
+					Prefs.shared.backupSeed.setName(name, encryptedNodeId: encryptedNodeId)
+					Prefs.shared.backupSeed.setHasUploadedSeed(true, encryptedNodeId: encryptedNodeId)
 					//
 					// And ensure manual backup is diabled for the wallet.
 					//
-					Prefs.shared.manualBackup_setTaskDone(false, encryptedNodeId: encryptedNodeId)
+					Prefs.shared.backupSeed.manualBackup_setTaskDone(false, encryptedNodeId: encryptedNodeId)
 				}
 			}
 			
@@ -783,16 +791,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 		log.trace("maybeRegisterFcmToken()")
 		assertMainThread()
 		
-		if !walletLoaded {
-			log.debug("maybeRegisterFcmToken: no: !walletLoaded")
+		if walletInfo == nil {
+			log.debug("maybeRegisterFcmToken: walletInfo is nil")
 			return
 		}
 		if fcmToken == nil {
-			log.debug("maybeRegisterFcmToken: no: !fcmToken")
+			log.debug("maybeRegisterFcmToken: fcmToken is nil")
 			return
 		}
 		if !(peerConnectionState is Lightning_kmpConnection.ESTABLISHED) {
-			log.debug("maybeRegisterFcmToken: no: !peerConnection")
+			log.debug("maybeRegisterFcmToken: peerConnection not established")
 			return
 		}
 		
@@ -835,147 +843,141 @@ class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
 		// registration. Which we could then use to trigger a storage in UserDefaults.
 	}
 	
-	// --------------------------------------------------
-	// MARK: Migration
-	// --------------------------------------------------
-	
-	private func performVersionUpgradeChecks() -> Void {
+	func maybeRegisterPushToken() -> Void {
+		log.trace("maybeRegisterPushToken()")
+		assertMainThread()
 		
-		// Upgrade check(s)
-
-		let key = "lastVersionCheck"
-		let previousBuild = UserDefaults.standard.string(forKey: key) ?? "3"
-
-		// v0.7.3 (build 4)
-		// - serialization change for Channels
-		// - attempting to deserialize old version causes crash
-		// - we decided to delete old channels database (due to low number of test users)
-		//
-		if previousBuild.isVersion(lessThan: "4") {
-			migrateChannelsDbFiles()
+		guard let pushToken = pushToken else {
+			log.debug("maybeRegisterPushToken: pushToken is nil")
+			return
 		}
-
-		// v0.7.4 (build 5)
-		// - serialization change for Channels
-		// - attempting to deserialize old version causes crash
-		//
-		if previousBuild.isVersion(lessThan: "5") {
-			migrateChannelsDbFiles()
-		}
-
-		// v0.7.6 (build 7)
-		// - adding support for both soft & hard biometrics
-		// - previously only supported hard biometics
-		//
-		if previousBuild.isVersion(lessThan: "7") {
-			AppSecurity.shared.performMigration(previousBuild: previousBuild)
-		}
-		
-		// v0.8.0 (build 8)
-		// - app db structure has changed
-		// - channels/payments db have changed but files are renamed, no need to delete
-		//
-		if previousBuild.isVersion(lessThan: "8") {
-			removeAppDbFile()
-		}
-
-		let currentBuild = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
-		if previousBuild.isVersion(lessThan: currentBuild) {
-
-			UserDefaults.standard.set(currentBuild, forKey: key)
-		}
-	}
-	
-	private func migrateChannelsDbFiles() -> Void {
-		
-		let fm = FileManager.default
-		
-		let appSupportDirs = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-		guard let appSupportDir = appSupportDirs.first else {
+		guard let walletInfo = walletInfo else {
+			log.debug("maybeRegisterPushToken: walletInfo is nil")
 			return
 		}
 		
-		let databasesDir = appSupportDir.appendingPathComponent("databases", isDirectory: true)
+		let nodeIdHash = walletInfo.nodeId.hash160().toSwiftData().toHex()
 		
-		let db1 = databasesDir.appendingPathComponent("channels.sqlite", isDirectory: false)
-		let db2 = databasesDir.appendingPathComponent("channels.sqlite-shm", isDirectory: false)
-		let db3 = databasesDir.appendingPathComponent("channels.sqlite-wal", isDirectory: false)
-		
-		if !fm.fileExists(atPath: db1.path) &&
-		   !fm.fileExists(atPath: db2.path) &&
-		   !fm.fileExists(atPath: db3.path)
-		{
-			// Database files don't exist. So there's nothing to migrate.
-			return
-		}
-		
-		let placeholder = "{version}"
-		
-		let template1 = "channels.\(placeholder).sqlite"
-		let template2 = "channels.\(placeholder).sqlite-shm"
-		let template3 = "channels.\(placeholder).sqlite-wal"
-		
-		var done = false
-		var version = 0
-		
-		while !done {
-			
-			let f1 = template1.replacingOccurrences(of: placeholder, with: String(version))
-			let f2 = template2.replacingOccurrences(of: placeholder, with: String(version))
-			let f3 = template3.replacingOccurrences(of: placeholder, with: String(version))
-			
-			let dst1 = databasesDir.appendingPathComponent(f1, isDirectory: false)
-			let dst2 = databasesDir.appendingPathComponent(f2, isDirectory: false)
-			let dst3 = databasesDir.appendingPathComponent(f3, isDirectory: false)
-			
-			if fm.fileExists(atPath: dst1.path) ||
-			   fm.fileExists(atPath: dst2.path) ||
-			   fm.fileExists(atPath: dst2.path)
+		if let prvRegistration = Prefs.shared.pushTokenRegistration {
+
+			if prvRegistration.pushToken == pushToken &&
+			   prvRegistration.nodeIdHash == nodeIdHash
 			{
-				version += 1
-			} else {
-				
-				try? fm.moveItem(at: db1, to: dst1)
-				try? fm.moveItem(at: db2, to: dst2)
-				try? fm.moveItem(at: db3, to: dst3)
-				
-				done = true
+				// We've already registered our {pushToken, nodeId} tuple.
+
+				if abs(prvRegistration.registrationDate.timeIntervalSinceNow) < 30.days() {
+					// The last registration was recent, so we can skip registration.
+					log.debug("Push token already registered")
+					return
+
+				} else {
+					// It's been awhile since we last registered, so let's re-register.
+					// This is a self-healing mechanism, in case of server problems.
+				}
 			}
 		}
 		
-		// As a safety precaution (to prevent a crash), always delete the original filePath.
+		let registration = PushTokenRegistration(
+			pushToken: pushToken,
+			nodeIdHash: nodeIdHash,
+			registrationDate: Date()
+		)
 		
-		try? fm.removeItem(at: db1)
-		try? fm.removeItem(at: db2)
-		try? fm.removeItem(at: db3)
+		let url = URL(string: "https://s7r6lsmzk7.execute-api.us-west-2.amazonaws.com/v1/pub/push/register")
+		guard let requestUrl = url else { return }
 		
-		// We just migrated the user's channels database.
-		// Which means their existing channels are going to get force closed by the server.
-		// So we need to inform the user about what just happened.
+		#if DEBUG
+		let platform = "iOS-development"
+		#else
+		// Note: This is actually wrong if you build-and-run using RELEASE mode.
+		let platform = "iOS-production"
+		#endif
 		
-//		popoverState.display(dismissable: false) {
-//			PardonOurMess()
-//		}
+		let body = [
+			"app_id"     : "co.acinq.phoenix",
+			"platform"   : platform,
+			"push_token" : pushToken,
+			"node_id"    : walletInfo.nodeId.value.toHex()
+		]
+		let bodyData = try? JSONSerialization.data(
+			 withJSONObject: body,
+			 options: []
+		)
+		
+		var request = URLRequest(url: requestUrl)
+		request.httpMethod = "POST"
+		request.httpBody = bodyData
+		
+		let task = URLSession.shared.dataTask(with: request) { (data, response, error) in
+			
+			var statusCode = 418
+			var success = false
+			if let httpResponse = response as? HTTPURLResponse {
+				statusCode = httpResponse.statusCode
+				if statusCode >= 200 && statusCode < 300 {
+					success = true
+				}
+			}
+			
+			if success {
+				log.debug("/push/register: success")
+				Prefs.shared.pushTokenRegistration = registration
+			}
+			else if let error = error {
+				log.debug("/push/register: error: \(String(describing: error))")
+			} else {
+				log.debug("/push/register: statusCode: \(statusCode)")
+				if let data = data, let dataString = String(data: data, encoding: .utf8) {
+					log.debug("/push/register: response:\n\(dataString)")
+				}
+			}
+		}
+		
+		log.debug("/push/register ...")
+		task.resume()
 	}
 	
-	private func removeAppDbFile() {
-		let fm = FileManager.default
+	private func didReceiveMessageFromAppExtension() {
+		log.trace("didReceiveMessageFromAppExtension()")
 		
-		let appSupportDirs = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-		guard let appSupportDir = appSupportDirs.first else {
-			return
+		// We received a message from the notification-service-extension.
+		// This usually happens when:
+		// - phoenix was running in the background
+		// - a received push notification launched our notification-service-extension
+		// - our app extension received an incoming payment
+		// - the user returns to phoenix app
+		//
+		// So our app extension may have updated the database.
+		// However, we don't know about all these changes yet...
+		//
+		// This is because the SQLDelight query flows do NOT automatically update
+		// if changes occur in a separate process. Within SQLDelight there is:
+		//
+		// `TransactorImpl.notifyQueries(...)`
+		//
+		// This function needs to get called in order for the flows to re-perform
+		// their query, and update their state.
+		//
+		// So there are 2 ways in which we can accomplish this:
+		// - Jump thru a bunch of hoops to subclass the SqlDriver,
+		//   and then add a custom transaction that calls invokes notifyQueries
+		//   with the appropriate parameters.
+		// - Just make some no-op calls, which automatically invoke notifyQueries for us.
+		//
+		// We're using the easier option for now.
+		// Especially since there are changes in the upcoming v2.0 release of SQLDelight
+		// that change the corresponding API, and aim to make it more accesible for us.
+		
+		let business = AppDelegate.get().business
+		business.databaseManager.paymentsDb { paymentsDb, _ in
+		
+			let fakePaymentId = WalletPaymentId.IncomingPaymentId(paymentHash: Bitcoin_kmpByteVector32.random())
+			paymentsDb?.deletePayment(paymentId: fakePaymentId) { _, _ in
+				// Nothing is actually deleted
+			}
 		}
-		
-		let databasesDir = appSupportDir.appendingPathComponent("databases", isDirectory: true)
-		let db = databasesDir.appendingPathComponent("app.sqlite", isDirectory: false)
-		if !fm.fileExists(atPath: db.path) {
-			return
-		} else {
-			try? fm.removeItem(at: db)
+		business.appDb.deleteBitcoinRate(fiat: "FakeFiatCurrency") { _, _ in
+			// Nothing is actually deleted
 		}
 	}
-}
-
-func assertMainThread() -> Void {
-	assert(Thread.isMainThread, "Improper thread: expected main thread; Thread-unsafe code ahead")
 }

@@ -13,8 +13,8 @@ fileprivate var log = Logger(OSLog.disabled)
 
 struct DisplayConfigurationView: View {
 	
-	@State var fiatCurrency = Prefs.shared.fiatCurrency
-	@State var bitcoinUnit = Prefs.shared.bitcoinUnit
+	@State var fiatCurrency = GroupPrefs.shared.fiatCurrency
+	@State var bitcoinUnit = GroupPrefs.shared.bitcoinUnit
 	@State var theme = Prefs.shared.theme
 	
 	@State var sectionId = UUID()
@@ -88,10 +88,10 @@ struct DisplayConfigurationView: View {
 		.onAppear {
 			onAppear()
 		}
-		.onReceive(Prefs.shared.fiatCurrencyPublisher) { newValue in
+		.onReceive(GroupPrefs.shared.fiatCurrencyPublisher) { newValue in
 			fiatCurrency = newValue
 		}
-		.onReceive(Prefs.shared.bitcoinUnitPublisher) { newValue in
+		.onReceive(GroupPrefs.shared.bitcoinUnitPublisher) { newValue in
 			bitcoinUnit = newValue
 		}
 		.onReceive(Prefs.shared.themePublisher) { newValue in
@@ -246,7 +246,7 @@ struct FiatCurrencySelector: View, ViewName {
 		log.trace("didSelect(fiatCurrency = \(fiatCurrency.shortName)")
 		
 		selectedFiatCurrency = fiatCurrency
-		Prefs.shared.fiatCurrency = fiatCurrency
+		GroupPrefs.shared.fiatCurrency = fiatCurrency
 		
 		DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
 			presentationMode.wrappedValue.dismiss()
@@ -361,7 +361,7 @@ struct BitcoinUnitSelector: View, ViewName {
 		log.trace("didSelect(bitcoinUnit = \(bitcoinUnit.shortName)")
 		
 		selectedBitcoinUnit = bitcoinUnit
-		Prefs.shared.bitcoinUnit = bitcoinUnit
+		GroupPrefs.shared.bitcoinUnit = bitcoinUnit
 		
 		DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
 			presentationMode.wrappedValue.dismiss()
